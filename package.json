@@ -1,0 +1,18 @@
+{
+    "name": "com.hlight.unity-foundation",
+    "version": "1.0.0",
+    "displayName": "Hlight Unity Foundation",
+    "description": "Application lifetime, scene scopes, transitions, bootstrap flow, and shared runtime utilities for Hlight Unity projects.",
+    "unity": "6000.0",
+    "dependencies": {
+        "com.cysharp.unitask": "2.5.11",
+        "com.hlight.dependency-inversion": "1.0.0",
+        "com.unity.modules.animation": "1.0.0",
+        "com.unity.modules.physics": "1.0.0",
+        "com.unity.modules.physics2d": "1.0.0",
+        "com.unity.ugui": "2.0.0"
+    },
+    "author": {
+        "name": "Hlight"
+    }
+}

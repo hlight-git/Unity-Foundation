@@ -1,0 +1,20 @@
+{
+    "name": "Hlight.Foundation.Editor",
+    "rootNamespace": "Hlight.Foundation.Editor",
+    "references": [
+        "Hlight.Foundation",
+        "UnityEngine.UI",
+        "UnityEditor.UI"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
