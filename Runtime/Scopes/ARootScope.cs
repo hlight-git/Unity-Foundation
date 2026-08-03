@@ -4,6 +4,7 @@ using UnityEngine;
 
 namespace Hlight.Foundation
 {
+    [DisallowMultipleComponent]
     public abstract class ARootScope : MonoBehaviour, IScope
     {
         private AServiceLocator _rootServiceLocator;
@@ -25,6 +26,8 @@ namespace Hlight.Foundation
         public event Action<bool> OnFocusStateChanged;
         public event Action OnDestroyed;
         public event Action OnQuit;
+
+        private void Awake() => DontDestroyOnLoad(gameObject);
 
         private void FixedUpdate() => OnFixedUpdate?.Invoke(Time.fixedDeltaTime);
 
