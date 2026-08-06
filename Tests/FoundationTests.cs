@@ -527,10 +527,6 @@ namespace Hlight.Foundation.Tests
 
         public sealed class TestBootstrap : ABootstrap<TestRootScope>
         {
-            protected override UniTask OnBootCompleted(CancellationToken cancellationToken)
-            {
-                return UniTask.CompletedTask;
-            }
         }
 
         public sealed class TestBootstrapTask : ABootstrapTask<TestRootScope>
