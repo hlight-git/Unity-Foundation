@@ -54,7 +54,7 @@ namespace Hlight.Foundation
         internal async UniTask ExecuteSetupAsync(CancellationToken cancellationToken)
         {
             var totalWeight = ValidateTasksAndGetTotalWeight();
-            await OnSetupBegin(cancellationToken);
+            await OnBootBegin(cancellationToken);
 
             var completedWeight = 0f;
             for (var i = 0; i < bootstrapTasks.Length; i++)
@@ -82,7 +82,7 @@ namespace Hlight.Foundation
                 }
             }
 
-            await OnSetupCompleted(cancellationToken);
+            await OnBootCompleted(cancellationToken);
             IsSetupCompleted = true;
             SetProgress(1f);
             SetupCompleted?.Invoke();
@@ -143,11 +143,10 @@ namespace Hlight.Foundation
             int totalTaskCount,
             CancellationToken cancellationToken) => UniTask.CompletedTask;
 
-        protected virtual UniTask OnSetupBegin(CancellationToken cancellationToken) =>
+        protected virtual UniTask OnBootBegin(CancellationToken cancellationToken) =>
             UniTask.CompletedTask;
 
-        protected virtual UniTask OnSetupCompleted(CancellationToken cancellationToken) =>
-            UniTask.CompletedTask;
+        protected abstract UniTask OnBootCompleted(CancellationToken cancellationToken);
 
         protected virtual void OnProgressChanged(float progress)
         {
