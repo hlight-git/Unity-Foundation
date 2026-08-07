@@ -4,7 +4,7 @@ using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using Cysharp.Threading.Tasks;
-using Hlight.DesignPattern.DependencyInversion.ServiceLocator;
+using Hlight.DesignPattern.DependencyInversion.DependencyInjection;
 using Hlight.Foundation.Editor;
 using NUnit.Framework;
 using UnityEditor;
@@ -17,7 +17,7 @@ namespace Hlight.Foundation.Tests
     public sealed class FoundationTests
     {
         [Test]
-        public async Task SceneScopeResolvesLocallyThenFallsBackToParent()
+        public async Task SceneScopeInjectsParentFirstThenItself()
         {
             var gameObject = new GameObject(nameof(TestSceneRoot));
             AddPendingSceneRoot<TestSceneRoot>(gameObject);
@@ -27,15 +27,67 @@ namespace Hlight.Foundation.Tests
             try
             {
                 await scope.LoadIfNeededAsync().AsTask();
+                var target = new ServiceTarget();
+                scope.Injector.Inject(target);
 
                 Assert.That(scope.State, Is.EqualTo(SceneScopeState.LoadedInactive));
-                Assert.That(scope.ServiceLocator, Is.SameAs(scope));
-                Assert.That(scope.TryProvide(out TestService local), Is.True);
-                Assert.That(local.Source, Is.EqualTo("scene"));
-                Assert.That(scope.TryProvide(out TestService parent, "parent"), Is.True);
-                Assert.That(parent.Source, Is.EqualTo("root"));
-                Assert.That(scope.TryProvide(out RootOnlyService rootOnly), Is.True);
-                Assert.That(rootOnly, Is.Not.Null);
+                Assert.That(target.Service.Source, Is.EqualTo("scene"), "the scene runs last and wins");
+                Assert.That(target.RootOnly, Is.Not.Null, "what only the parent sets must survive");
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(gameObject);
+            }
+        }
+
+        [Test]
+        public async Task SceneScopeHasNoInjectorUntilLoadedAndLosesItOnUnload()
+        {
+            var gameObject = new GameObject(nameof(LifecycleSceneRoot));
+            AddPendingSceneRoot<LifecycleSceneRoot>(gameObject);
+            var scope = new SceneScope<LifecycleSceneRoot>(new FakeSceneLease())
+                .SetParentScope(new TestParentScope());
+
+            try
+            {
+                Assert.Throws<InvalidOperationException>(() => _ = scope.Injector);
+
+                await scope.LoadIfNeededAsync().AsTask();
+                Assert.DoesNotThrow(() => _ = scope.Injector);
+
+                await scope.UnloadAsync().AsTask();
+                Assert.Throws<InvalidOperationException>(() => _ = scope.Injector);
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(gameObject);
+            }
+        }
+
+        [Test]
+        public async Task ReusedSceneGetsAFreshInjector()
+        {
+            var gameObject = new GameObject(nameof(LifecycleSceneRoot));
+            AddPendingSceneRoot<LifecycleSceneRoot>(gameObject);
+            var scope = new SceneScope<LifecycleSceneRoot>(new FakeSceneLease())
+                .SetParentScope(new TestParentScope());
+            SetPrivateField(scope, "reuseScene", true);
+
+            try
+            {
+                await scope.LoadIfNeededAsync().AsTask();
+                var first = scope.Injector;
+
+                await scope.UnloadAsync().AsTask();
+                Assert.That(scope.State, Is.EqualTo(SceneScopeState.Cached));
+
+                await scope.LoadIfNeededAsync().AsTask();
+
+                Assert.That(scope.Injector, Is.Not.SameAs(first),
+                    "a reused scene must not keep an injector chained to the previous load");
+                var target = new ServiceTarget();
+                scope.Injector.Inject(target);
+                Assert.That(target.Service.Source, Is.EqualTo("scene"));
             }
             finally
             {
@@ -116,15 +168,16 @@ namespace Hlight.Foundation.Tests
             try
             {
                 await scope.LoadIfNeededAsync().AsTask();
-                Assert.That(scope.TryProvide(out TestService loadedService), Is.True);
-                Assert.That(loadedService.Source, Is.EqualTo("scene"));
+                var loaded = new ServiceTarget();
+                scope.Injector.Inject(loaded);
+                Assert.That(loaded.Service.Source, Is.EqualTo("scene"));
 
                 await scope.UnloadAsync().AsTask();
 
                 Assert.That(scope.State, Is.EqualTo(SceneScopeState.Cached));
                 Assert.That(sceneLease.UnloadCount, Is.Zero);
-                Assert.That(scope.TryProvide(out TestService cachedService), Is.True);
-                Assert.That(cachedService.Source, Is.EqualTo("root"));
+                Assert.Throws<InvalidOperationException>(() => _ = scope.Injector,
+                    "a cached scene has released its injector");
 
                 await scope.ReleaseAsync().AsTask();
 
@@ -345,6 +398,153 @@ namespace Hlight.Foundation.Tests
             }
         }
 
+        [Test, Timeout(5000)]
+        public async Task BootstrapRunsIndependentTasksTogether()
+        {
+            var gameObject = NewBootstrap(out var bootstrap, out var firstTask, out var secondTask);
+
+            // The first task cannot finish until the second one has started, so this only completes
+            // if the two really do overlap; run one after the other it deadlocks into the timeout.
+            var log = new List<string>();
+            var secondStarted = new UniTaskCompletionSource();
+            firstTask.Label = "first";
+            firstTask.Log = log;
+            firstTask.Wait = secondStarted;
+            secondTask.Label = "second";
+            secondTask.Log = log;
+            secondTask.Release = secondStarted;
+
+            try
+            {
+                await bootstrap.ExecuteSetupAsync(CancellationToken.None).AsTask();
+
+                Assert.That(log, Is.EquivalentTo(
+                    new[] { "first start", "second start", "first end", "second end" }));
+                Assert.That(bootstrap.Progress, Is.EqualTo(1f));
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(gameObject);
+            }
+        }
+
+        [Test, Timeout(5000)]
+        public async Task BootstrapHoldsATaskUntilWhatItRequiresIsProvided()
+        {
+            var gameObject = NewBootstrap(out var bootstrap, out var providerTask, out var consumerTask);
+
+            // Listed last, so only the declaration can put it first.
+            var log = new List<string>();
+            providerTask.Label = "provider";
+            providerTask.Log = log;
+            providerTask.ProvidedTypes = new[] { typeof(ProvidedByFirst) };
+            consumerTask.Label = "consumer";
+            consumerTask.Log = log;
+            consumerTask.RequiredTypes = new[] { typeof(ProvidedByFirst) };
+
+            SetPrivateField(
+                typeof(ABootstrap<TestRootScope>),
+                bootstrap,
+                "bootstrapTasks",
+                new ABootstrapTask<TestRootScope>[] { consumerTask, providerTask });
+
+            try
+            {
+                await bootstrap.ExecuteSetupAsync(CancellationToken.None).AsTask();
+
+                Assert.That(log, Is.EqualTo(
+                    new[] { "provider start", "provider end", "consumer start", "consumer end" }));
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(gameObject);
+            }
+        }
+
+        [Test]
+        public void BootstrapRejectsARequirementNobodyProvides()
+        {
+            var gameObject = NewBootstrap(out var bootstrap, out var firstTask, out _);
+            firstTask.RequiredTypes = new[] { typeof(ProvidedByFirst) };
+
+            try
+            {
+                var exception = Assert.ThrowsAsync<InvalidOperationException>(
+                    async () => await bootstrap.ExecuteSetupAsync(CancellationToken.None).AsTask());
+
+                Assert.That(exception.Message, Does.Contain(nameof(ProvidedByFirst)));
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(gameObject);
+            }
+        }
+
+        [Test]
+        public void BootstrapRejectsTwoTasksProvidingTheSameType()
+        {
+            var gameObject = NewBootstrap(out var bootstrap, out var firstTask, out var secondTask);
+            firstTask.ProvidedTypes = new[] { typeof(ProvidedByFirst) };
+            secondTask.ProvidedTypes = new[] { typeof(ProvidedByFirst) };
+
+            try
+            {
+                var exception = Assert.ThrowsAsync<InvalidOperationException>(
+                    async () => await bootstrap.ExecuteSetupAsync(CancellationToken.None).AsTask());
+
+                Assert.That(exception.Message, Does.Contain(nameof(ProvidedByFirst)));
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(gameObject);
+            }
+        }
+
+        [Test]
+        public void BootstrapRejectsACycle()
+        {
+            var gameObject = NewBootstrap(out var bootstrap, out var firstTask, out var secondTask);
+            firstTask.ProvidedTypes = new[] { typeof(ProvidedByFirst) };
+            firstTask.RequiredTypes = new[] { typeof(ProvidedBySecond) };
+            secondTask.ProvidedTypes = new[] { typeof(ProvidedBySecond) };
+            secondTask.RequiredTypes = new[] { typeof(ProvidedByFirst) };
+
+            try
+            {
+                var exception = Assert.ThrowsAsync<InvalidOperationException>(
+                    async () => await bootstrap.ExecuteSetupAsync(CancellationToken.None).AsTask());
+
+                Assert.That(exception.Message, Does.Contain("cycle"));
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(gameObject);
+            }
+        }
+
+        /// <summary>A disabled bootstrap wired to two blank tasks, in list order.</summary>
+        private static GameObject NewBootstrap(
+            out TestBootstrap bootstrap,
+            out TestBootstrapTask firstTask,
+            out TestBootstrapTask secondTask)
+        {
+            var gameObject = new GameObject("bootstrap");
+            gameObject.SetActive(false);
+            var rootScope = gameObject.AddComponent<TestRootScope>();
+            bootstrap = gameObject.AddComponent<TestBootstrap>();
+            firstTask = gameObject.AddComponent<TestBootstrapTask>();
+            secondTask = gameObject.AddComponent<TestBootstrapTask>();
+
+            SetPrivateField(typeof(ABootstrap<TestRootScope>), bootstrap, "rootScope", rootScope);
+            SetPrivateField(
+                typeof(ABootstrap<TestRootScope>),
+                bootstrap,
+                "bootstrapTasks",
+                new ABootstrapTask<TestRootScope>[] { firstTask, secondTask });
+
+            return gameObject;
+        }
+
         [Test]
         public async Task FailedRollbackKeepsOwnershipUntilReleaseSucceeds()
         {
@@ -443,12 +643,13 @@ namespace Hlight.Foundation.Tests
             }
         }
 
-        public sealed class TestSceneRoot : ASceneRoot, IProvider<TestService>
+        public sealed class TestSceneRoot : ASceneRoot, IDependencyResolvable<ServiceTarget>
         {
             private readonly TestService _service = new("scene");
 
-            TestService IProvider<TestService>.Provide(string key) =>
-                key == "parent" ? null : _service;
+            // Overwrites the root's TestService, leaves RootOnly as the root set it —
+            // that split is what the chain-order test reads.
+            public void ResolveDependenciesFor(ServiceTarget target) => target.Service = _service;
         }
 
         public sealed class BlockingSceneRoot : ASceneRoot
@@ -462,13 +663,13 @@ namespace Hlight.Foundation.Tests
             public void CompleteLoading() => _loadCompletion.TrySetResult();
         }
 
-        public sealed class LifecycleSceneRoot : ASceneRoot, IProvider<TestService>
+        public sealed class LifecycleSceneRoot : ASceneRoot, IDependencyResolvable<ServiceTarget>
         {
             private readonly TestService _service = new("scene");
 
             public List<string> Lifecycle { get; } = new();
 
-            TestService IProvider<TestService>.Provide(string key) => _service;
+            public void ResolveDependenciesFor(ServiceTarget target) => target.Service = _service;
 
             public override UniTask OnSceneLoaded(
                 bool isReusing,
@@ -536,31 +737,66 @@ namespace Hlight.Foundation.Tests
         public sealed class TestBootstrapTask : ABootstrapTask<TestRootScope>
         {
             public float ReportedProgress { get; set; }
+            public string Label { get; set; } = "task";
+            public List<string> Log { get; set; }
 
-            public override UniTask Execute(
+            public Type[] RequiredTypes { get; set; } = Array.Empty<Type>();
+            public Type[] ProvidedTypes { get; set; } = Array.Empty<Type>();
+
+            /// <summary>Signalled as soon as this task starts, to unblock a sibling's Wait.</summary>
+            public UniTaskCompletionSource Release { get; set; }
+
+            /// <summary>Blocks this task until a sibling starts — only reachable if they overlap.</summary>
+            public UniTaskCompletionSource Wait { get; set; }
+
+            public override Type[] Requires => RequiredTypes;
+            public override Type[] Provides => ProvidedTypes;
+
+            public override async UniTask Execute(
                 TestRootScope scope,
                 IProgress<float> progress,
                 CancellationToken cancellationToken)
             {
+                Log?.Add($"{Label} start");
+                Release?.TrySetResult();
+                if (Wait != null) await Wait.Task;
+
                 progress.Report(ReportedProgress);
-                return UniTask.CompletedTask;
+                Log?.Add($"{Label} end");
             }
         }
 
+        /// <summary>Stand-ins for whatever a real task hands the scope.</summary>
+        private sealed class ProvidedByFirst
+        {
+        }
+
+        private sealed class ProvidedBySecond
+        {
+        }
+
+        /// <summary>Target the scopes configure — the scene one refines what the root set.</summary>
+        public class ServiceTarget
+        {
+            public TestService Service { get; set; }
+            public RootOnlyService RootOnly { get; set; }
+        }
+
         private sealed class TestParentScope :
-            AServiceLocator,
             IScope,
-            IProvider<TestService>,
-            IProvider<RootOnlyService>
+            IDependencyResolvable<ServiceTarget>
         {
             private readonly TestService _service = new("root");
             private readonly RootOnlyService _rootOnlyService = new();
+            private DependencyInjector _injector;
 
-            protected override AServiceLocator ParentServiceLocator => null;
-            public AServiceLocator ServiceLocator => this;
+            public DependencyInjector Injector => _injector ??= new DependencyInjector(this);
 
-            TestService IProvider<TestService>.Provide(string key) => _service;
-            RootOnlyService IProvider<RootOnlyService>.Provide(string key) => _rootOnlyService;
+            public void ResolveDependenciesFor(ServiceTarget target)
+            {
+                target.Service = _service;
+                target.RootOnly = _rootOnlyService;
+            }
         }
 
         private sealed class FailingTransition : ISceneTransition

@@ -1,15 +1,15 @@
 # Hlight Application Foundation
 
-Application Foundation provides a root application lifetime, hierarchical scene service
-locators, additive scene loading, and a small scene-transition contract.
+Application Foundation provides a root application lifetime, hierarchical scene
+dependency injection, additive scene loading, and a small scene-transition contract.
 All runtime APIs belong to the single `Hlight.Foundation` assembly and namespace; the
 package does not split its public surface into `Core` and `Scoped` layers.
 
 ## Scope hierarchy
 
-`ARootScope` is the application-wide provider source. A concrete root implements
-`IProvider<T>` for every application service it owns. Its `ServiceLocator` is the
-parent of each `SceneScope<TSceneRoot>`.
+`ARootScope` is the application-wide dependency source. A concrete root implements
+`IDependencyResolvable<T>` for every target type it configures. Its `Injector` is the
+parent of each `SceneScope<TSceneRoot>`'s.
 
 `ARootScope` also owns the serialized `RuntimeApplicationConfig` (target frame rate,
 sleep timeout, multi-touch) and republishes Unity's player loop and application
@@ -18,28 +18,36 @@ callbacks as events: `OnFixedUpdate`, `OnUpdate`, `OnLateUpdate`,
 that need per-frame work subscribe to the root instead of adding their own
 `MonoBehaviour`.
 
-`ASceneRoot` is the provider source for one scene. Resolution checks the scene root
-first and bubbles to the root locator when the local provider returns `null`.
+`ASceneRoot` is the dependency source for one scene. Injecting a target runs the root
+scope's resolvers first, then the scene's, so a scene refines what the application set.
 
 ```csharp
 public sealed class HomeRoot : ASceneRoot,
-    IProvider<IHomeCamera>
+    IDependencyResolvable<HomeHud>
 {
-    IHomeCamera IProvider<IHomeCamera>.Provide(string key) => camera;
+    public void ResolveDependenciesFor(HomeHud target) => target.Camera = camera;
 }
 
 homeScope.SetParentScope(rootScope);
 
 await homeScope.LoadIfNeededAsync(cancellationToken);
 await homeScope.EnableAsync(cancellationToken);
+
+hud.GetComponentsInChildren<HomeHud>();     // whatever the scene creates
+homeRoot.Injector.Inject(hud);
 ```
 
-Scene roots may use `ServiceLocator` after the scope has bound them. An `Awake`
+Scene roots may use `Injector` after the scope has bound them. An `Awake`
 override must call `base.Awake()` so the root enters the pending-root queue.
 
 `ARootScope` and `SceneScope<TSceneRoot>` implement `IScope`. Their only shared
-contract is ownership of an `AServiceLocator`; root and scene lifecycles intentionally
+contract is ownership of a `DependencyInjector`; root and scene lifecycles intentionally
 remain separate. A scene scope must receive its parent before its first load.
+
+**A scene's injector exists only while its root is bound.** It is built at bind time and
+dropped on unload or cache, so `SceneScope.Injector` throws while the scene is not loaded
+and a reused scene gets a fresh one — an injector holds the parent it was chained onto, and
+the previous load's parent must not survive into the next.
 
 ## Scene lifecycle
 

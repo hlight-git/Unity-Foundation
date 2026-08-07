@@ -1,5 +1,5 @@
 using System;
-using Hlight.DesignPattern.DependencyInversion.ServiceLocator;
+using Hlight.DesignPattern.DependencyInversion.DependencyInjection;
 using UnityEngine;
 
 namespace Hlight.Foundation
@@ -7,17 +7,22 @@ namespace Hlight.Foundation
     [DisallowMultipleComponent]
     public abstract class ARootScope : MonoBehaviour, IScope
     {
-        private AServiceLocator _rootServiceLocator;
+        private DependencyInjector _injector;
 
         [field: SerializeField]
         public RuntimeApplicationConfig RuntimeApplicationConfig { get; private set; } = new();
 
         /// <summary>
-        /// Service locator backed by the <see cref="IProvider{T}"/> facets implemented by
-        /// this root scope. Scene scopes use it as the root of their locator chain.
+        /// Injector backed by the <c>IDependencyResolvable&lt;T&gt;</c> facets implemented by
+        /// this root scope. Scene scopes chain their own injector onto this one.
         /// </summary>
-        public AServiceLocator ServiceLocator
-            => _rootServiceLocator ??= new RootScopeServiceLocator(this);
+        /// <remarks>
+        /// Building it early is safe: the injector captures which target types this scope can
+        /// configure — that comes from the interfaces it declares, fixed at compile time —
+        /// while the resolvers themselves read this scope's state only when a target is
+        /// injected. A service assigned later in bootstrap is therefore still picked up.
+        /// </remarks>
+        public DependencyInjector Injector => _injector ??= new DependencyInjector(this);
 
         public event Action<float> OnFixedUpdate;
         public event Action<float, float> OnUpdate;
@@ -42,18 +47,5 @@ namespace Hlight.Foundation
         private void OnApplicationQuit() => OnQuit?.Invoke();
 
         private void OnDestroy() => OnDestroyed?.Invoke();
-
-        private sealed class RootScopeServiceLocator : AServiceLocator
-        {
-            private readonly ARootScope _providerSource;
-
-            public RootScopeServiceLocator(ARootScope providerSource)
-            {
-                _providerSource = providerSource;
-            }
-
-            protected override AServiceLocator ParentServiceLocator => null;
-            protected override object ProviderSource => _providerSource;
-        }
     }
 }

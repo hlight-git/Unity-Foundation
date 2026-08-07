@@ -2,15 +2,16 @@ using System;
 using System.Collections.Generic;
 using System.Threading;
 using Cysharp.Threading.Tasks;
-using Hlight.DesignPattern.DependencyInversion.ServiceLocator;
+using Hlight.DesignPattern.DependencyInversion.DependencyInjection;
 using UnityEngine;
 
 namespace Hlight.Foundation
 {
     /// <summary>
-    /// Scene-owned service source. A concrete root implements one
-    /// <c>IProvider&lt;T&gt;</c> per local service. Each root type identifies one scene
-    /// definition; loaded roots are claimed in <see cref="Awake"/> order.
+    /// Scene-owned dependency source. A concrete root implements one
+    /// <c>IDependencyResolvable&lt;T&gt;</c> per target type the scene configures. Each root
+    /// type identifies one scene definition; loaded roots are claimed in <see cref="Awake"/>
+    /// order.
     /// </summary>
     public abstract class ASceneRoot : MonoBehaviour
     {
@@ -56,16 +57,16 @@ namespace Hlight.Foundation
 
         #endregion
 
-        private AServiceLocator _serviceLocator;
+        private DependencyInjector _injector;
 
-        internal bool IsServiceLocatorBound => _serviceLocator != null;
+        internal bool IsInjectorBound => _injector != null;
 
         /// <summary>
-        /// Locator for this scene scope. It checks providers implemented by this root,
-        /// then bubbles to the parent scope.
+        /// Injector for this scene scope: the parent scope's resolvers run first, then the
+        /// ones this root declares. Hand it to whatever creates objects inside the scene.
         /// </summary>
-        public AServiceLocator ServiceLocator
-            => _serviceLocator ?? throw new InvalidOperationException(
+        public DependencyInjector Injector
+            => _injector ?? throw new InvalidOperationException(
                 $"{GetType().Name} is not attached to a loaded scene scope.");
 
         /// <remarks>Overrides must call <c>base.Awake()</c> to register the root.</remarks>
@@ -74,12 +75,12 @@ namespace Hlight.Foundation
             PendingRoots.Add(this);
         }
 
-        internal void BindServiceLocator(AServiceLocator serviceLocator)
+        internal void BindInjector(DependencyInjector injector)
         {
-            _serviceLocator = serviceLocator ?? throw new ArgumentNullException(nameof(serviceLocator));
+            _injector = injector ?? throw new ArgumentNullException(nameof(injector));
         }
 
-        internal void UnbindServiceLocator() => _serviceLocator = null;
+        internal void UnbindInjector() => _injector = null;
 
         public virtual UniTask OnSceneLoaded(bool isReusing, CancellationToken cancellationToken) => UniTask.CompletedTask;
         public virtual UniTask OnSceneEnable(CancellationToken cancellationToken) => UniTask.CompletedTask;

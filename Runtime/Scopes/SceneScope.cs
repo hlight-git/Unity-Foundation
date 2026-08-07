@@ -1,13 +1,13 @@
 using System;
 using System.Threading;
 using Cysharp.Threading.Tasks;
-using Hlight.DesignPattern.DependencyInversion.ServiceLocator;
+using Hlight.DesignPattern.DependencyInversion.DependencyInjection;
 using UnityEngine;
 
 namespace Hlight.Foundation
 {
     [Serializable]
-    public class SceneScope<TSceneRoot> : AServiceLocator, IScope
+    public class SceneScope<TSceneRoot> : IScope
         where TSceneRoot : ASceneRoot
     {
         [SerializeField] private string sceneName;
@@ -18,13 +18,17 @@ namespace Hlight.Foundation
         private TSceneRoot _sceneRoot;
         [NonSerialized] private ISceneLease _sceneLease;
         private bool _isOperating;
-        private AServiceLocator _parentServiceLocator;
+        private IScope _parentScope;
+        private DependencyInjector _injector;
 
-        protected override AServiceLocator ParentServiceLocator => _parentServiceLocator;
-        protected override object ProviderSource =>
-            SceneRoot != null && SceneRoot.IsServiceLocatorBound ? SceneRoot : null;
+        /// <summary>
+        /// This scene's injector, chained onto the parent scope's. Exists only while a root
+        /// is bound — a scene that is unloaded or cached has none.
+        /// </summary>
+        public DependencyInjector Injector
+            => _injector ?? throw new InvalidOperationException(
+                $"Scene '{LoadSceneKey}' has no injector while its state is {State}.");
 
-        public AServiceLocator ServiceLocator => this;
         public string LoadSceneKey => useAddressable ? addressablePath : sceneName;
         public SceneScopeState State { get; private set; } = SceneScopeState.Unloaded;
 
@@ -45,6 +49,11 @@ namespace Hlight.Foundation
             _sceneLease = sceneLease ?? throw new ArgumentNullException(nameof(sceneLease));
         }
 
+        /// <summary>
+        /// Sets the scope this one chains onto. The parent's injector is read at bind time,
+        /// not here — a parent scene scope has none until it loads, so capturing it now would
+        /// capture nothing.
+        /// </summary>
         public SceneScope<TSceneRoot> SetParentScope(IScope parentScope)
         {
             if (_isOperating)
@@ -58,17 +67,12 @@ namespace Hlight.Foundation
             if (parentScope == null)
                 throw new ArgumentNullException(nameof(parentScope));
 
-            var serviceLocator = parentScope.ServiceLocator ??
-                throw new ArgumentException(
-                    "The parent scope must expose a service locator.",
-                    nameof(parentScope));
-
-            if (ReferenceEquals(serviceLocator, this))
+            if (ReferenceEquals(parentScope, this))
                 throw new ArgumentException(
                     "A scene scope cannot be its own parent.",
                     nameof(parentScope));
 
-            _parentServiceLocator = serviceLocator;
+            _parentScope = parentScope;
             return this;
         }
 
@@ -162,7 +166,7 @@ namespace Hlight.Foundation
             SceneLease.Track(SceneRoot.gameObject.scene);
 
             if (wasCached)
-                SceneRoot.BindServiceLocator(this);
+                BindInjector();
 
             try
             {
@@ -171,20 +175,20 @@ namespace Hlight.Foundation
             catch
             {
                 if (wasCached)
-                    SceneRoot.UnbindServiceLocator();
+                    UnbindInjector();
                 throw;
             }
 
             if (shouldCache)
             {
-                SceneRoot.UnbindServiceLocator();
+                UnbindInjector();
                 State = SceneScopeState.Cached;
                 return;
             }
 
             // Unity scene operations cannot be cancelled reliably after they start.
             // Keep ownership until the physical unload has completed.
-            SceneRoot.UnbindServiceLocator();
+            UnbindInjector();
             try
             {
                 await ReleaseOwnedSceneAsync();
@@ -192,7 +196,7 @@ namespace Hlight.Foundation
             catch
             {
                 if (!wasCached)
-                    SceneRoot.BindServiceLocator(this);
+                    BindInjector();
                 throw;
             }
 
@@ -241,7 +245,7 @@ namespace Hlight.Foundation
                 SceneLease.Track(root.gameObject.scene);
                 cancellationToken.ThrowIfCancellationRequested();
 
-                SceneRoot.BindServiceLocator(this);
+                BindInjector();
                 sceneLifecycleStarted = true;
                 await SceneRoot.OnSceneLoaded(false, cancellationToken);
                 State = SceneScopeState.LoadedInactive;
@@ -268,13 +272,13 @@ namespace Hlight.Foundation
             try
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                SceneRoot.BindServiceLocator(this);
+                BindInjector();
                 await SceneRoot.OnSceneLoaded(true, cancellationToken);
                 State = SceneScopeState.LoadedInactive;
             }
             catch
             {
-                SceneRoot.UnbindServiceLocator();
+                UnbindInjector();
                 State = SceneScopeState.Cached;
                 throw;
             }
@@ -302,7 +306,7 @@ namespace Hlight.Foundation
                 }
             }
 
-            SceneRoot?.UnbindServiceLocator();
+            UnbindInjector();
 
             try
             {
@@ -331,9 +335,28 @@ namespace Hlight.Foundation
 
         private void EnsureParentConfigured()
         {
-            if (_parentServiceLocator == null)
+            if (_parentScope == null)
                 throw new InvalidOperationException(
                     $"Scene '{LoadSceneKey}' requires a parent scope before loading.");
+        }
+
+        /// <summary>
+        /// Builds this scene's injector over the parent's and hands it to the root.
+        /// </summary>
+        /// <remarks>
+        /// Rebuilt on every bind rather than kept: an injector holds the parent it was
+        /// chained onto, so a reused scene must not carry the one from its previous load.
+        /// </remarks>
+        private void BindInjector()
+        {
+            _injector = new DependencyInjector(SceneRoot, _parentScope.Injector);
+            SceneRoot.BindInjector(_injector);
+        }
+
+        private void UnbindInjector()
+        {
+            SceneRoot?.UnbindInjector();
+            _injector = null;
         }
 
         private OperationScope BeginOperation(string operation)
