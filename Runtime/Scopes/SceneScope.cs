@@ -32,7 +32,12 @@ namespace Hlight.Foundation
         public string LoadSceneKey => useAddressable ? addressablePath : sceneName;
         public SceneScopeState State { get; private set; } = SceneScopeState.Unloaded;
 
-        protected TSceneRoot SceneRoot
+        /// <summary>
+        /// The loaded root, or <c>null</c> while this scope is unloaded. Public because a scope's
+        /// root is the typed handle on whatever that scene exposes — a caller that owns the scope
+        /// reaches the scene through here rather than through an untyped lookup.
+        /// </summary>
+        public TSceneRoot SceneRoot
         {
             get => _sceneRoot;
             private set => _sceneRoot = value;
@@ -355,7 +360,10 @@ namespace Hlight.Foundation
 
         private void UnbindInjector()
         {
-            SceneRoot?.UnbindInjector();
+            // `!= null`, not `?.` — SceneRoot is a UnityEngine.Object, and `?.` tests the managed
+            // reference while the object may already be destroyed. Rollback reaches here in exactly
+            // that state.
+            if (SceneRoot != null) SceneRoot.UnbindInjector();
             _injector = null;
         }
 

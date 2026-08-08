@@ -362,35 +362,19 @@ namespace Hlight.Foundation.Tests
         }
 
         [Test]
-        public async Task BootstrapProgressUsesTaskWeights()
+        public async Task BootstrapProgressTracksCompletedTasks()
         {
-            var gameObject = new GameObject("bootstrap");
-            gameObject.SetActive(false);
-            var rootScope = gameObject.AddComponent<TestRootScope>();
-            var bootstrap = gameObject.AddComponent<TestBootstrap>();
-            var firstTask = gameObject.AddComponent<TestBootstrapTask>();
-            var secondTask = gameObject.AddComponent<TestBootstrapTask>();
-            firstTask.ReportedProgress = 0.5f;
-            secondTask.ReportedProgress = 0.5f;
-            SetPrivateField(typeof(ABootstrapTask<TestRootScope>), firstTask, "weight", 1f);
-            SetPrivateField(typeof(ABootstrapTask<TestRootScope>), secondTask, "weight", 3f);
-            SetPrivateField(typeof(ABootstrap<TestRootScope>), bootstrap, "rootScope", rootScope);
-            SetPrivateField(
-                typeof(ABootstrap<TestRootScope>),
-                bootstrap,
-                "bootstrapTasks",
-                new ABootstrapTask<TestRootScope>[] { firstTask, secondTask });
-            var progress = new List<float>();
-            bootstrap.ProgressChanged += progress.Add;
+            var gameObject = NewBootstrap(out var bootstrap, out _, out _);
 
             try
             {
+                var reported = new List<float>();
+                bootstrap.ProgressChanged += reported.Add;
+
                 await bootstrap.ExecuteSetupAsync(CancellationToken.None).AsTask();
 
-                Assert.That(progress, Has.Some.EqualTo(0.125f).Within(0.0001f));
-                Assert.That(progress, Has.Some.EqualTo(0.25f).Within(0.0001f));
-                Assert.That(progress, Has.Some.EqualTo(0.625f).Within(0.0001f));
-                Assert.That(progress[^1], Is.EqualTo(1f));
+                Assert.That(reported, Is.EqualTo(new[] { 0.5f, 1f }));
+                Assert.That(bootstrap.Progress, Is.EqualTo(1f));
             }
             finally
             {
@@ -429,24 +413,17 @@ namespace Hlight.Foundation.Tests
         }
 
         [Test, Timeout(5000)]
-        public async Task BootstrapHoldsATaskUntilWhatItRequiresIsProvided()
+        public async Task BootstrapHoldsATaskUntilTheOneItWaitsForIsDone()
         {
-            var gameObject = NewBootstrap(out var bootstrap, out var providerTask, out var consumerTask);
+            var gameObject = NewBootstrap(out var bootstrap, out var consumerTask, out var providerTask);
 
-            // Listed last, so only the declaration can put it first.
+            // The consumer is listed first, so only the wait can put it second.
             var log = new List<string>();
             providerTask.Label = "provider";
             providerTask.Log = log;
-            providerTask.ProvidedTypes = new[] { typeof(ProvidedByFirst) };
             consumerTask.Label = "consumer";
             consumerTask.Log = log;
-            consumerTask.RequiredTypes = new[] { typeof(ProvidedByFirst) };
-
-            SetPrivateField(
-                typeof(ABootstrap<TestRootScope>),
-                bootstrap,
-                "bootstrapTasks",
-                new ABootstrapTask<TestRootScope>[] { consumerTask, providerTask });
+            WaitFor(consumerTask, providerTask);
 
             try
             {
@@ -461,88 +438,134 @@ namespace Hlight.Foundation.Tests
             }
         }
 
-        [Test]
-        public void BootstrapRejectsARequirementNobodyProvides()
+        [Test, Timeout(5000)]
+        public async Task BootstrapRunsATaskTwoOthersWaitFor()
         {
-            var gameObject = NewBootstrap(out var bootstrap, out var firstTask, out _);
-            firstTask.RequiredTypes = new[] { typeof(ProvidedByFirst) };
-
-            try
-            {
-                var exception = Assert.ThrowsAsync<InvalidOperationException>(
-                    async () => await bootstrap.ExecuteSetupAsync(CancellationToken.None).AsTask());
-
-                Assert.That(exception.Message, Does.Contain(nameof(ProvidedByFirst)));
-            }
-            finally
-            {
-                UnityEngine.Object.DestroyImmediate(gameObject);
-            }
-        }
-
-        [Test]
-        public void BootstrapRejectsTwoTasksProvidingTheSameType()
-        {
-            var gameObject = NewBootstrap(out var bootstrap, out var firstTask, out var secondTask);
-            firstTask.ProvidedTypes = new[] { typeof(ProvidedByFirst) };
-            secondTask.ProvidedTypes = new[] { typeof(ProvidedByFirst) };
-
-            try
-            {
-                var exception = Assert.ThrowsAsync<InvalidOperationException>(
-                    async () => await bootstrap.ExecuteSetupAsync(CancellationToken.None).AsTask());
-
-                Assert.That(exception.Message, Does.Contain(nameof(ProvidedByFirst)));
-            }
-            finally
-            {
-                UnityEngine.Object.DestroyImmediate(gameObject);
-            }
-        }
-
-        [Test]
-        public void BootstrapRejectsACycle()
-        {
-            var gameObject = NewBootstrap(out var bootstrap, out var firstTask, out var secondTask);
-            firstTask.ProvidedTypes = new[] { typeof(ProvidedByFirst) };
-            firstTask.RequiredTypes = new[] { typeof(ProvidedBySecond) };
-            secondTask.ProvidedTypes = new[] { typeof(ProvidedBySecond) };
-            secondTask.RequiredTypes = new[] { typeof(ProvidedByFirst) };
-
-            try
-            {
-                var exception = Assert.ThrowsAsync<InvalidOperationException>(
-                    async () => await bootstrap.ExecuteSetupAsync(CancellationToken.None).AsTask());
-
-                Assert.That(exception.Message, Does.Contain("cycle"));
-            }
-            finally
-            {
-                UnityEngine.Object.DestroyImmediate(gameObject);
-            }
-        }
-
-        /// <summary>A disabled bootstrap wired to two blank tasks, in list order.</summary>
-        private static GameObject NewBootstrap(
-            out TestBootstrap bootstrap,
-            out TestBootstrapTask firstTask,
-            out TestBootstrapTask secondTask)
-        {
+            // A diamond: both middles wait for the root, and the sink waits for both middles.
+            // Two tasks parked on one running task is the case a shared UniTask cannot serve — it
+            // holds a single continuation, and Preserve() only lifts that once the task has already
+            // finished. This is the smallest graph with a fan-out at all.
             var gameObject = new GameObject("bootstrap");
             gameObject.SetActive(false);
             var rootScope = gameObject.AddComponent<TestRootScope>();
-            bootstrap = gameObject.AddComponent<TestBootstrap>();
-            firstTask = gameObject.AddComponent<TestBootstrapTask>();
-            secondTask = gameObject.AddComponent<TestBootstrapTask>();
+            var bootstrap = gameObject.AddComponent<TestBootstrap>();
+
+            var log = new List<string>();
+
+            TestBootstrapTask Task(string label)
+            {
+                var task = gameObject.AddComponent<TestBootstrapTask>();
+                task.Label = label;
+                task.Log = log;
+                return task;
+            }
+
+            var root = Task("root");
+            var left = Task("left");
+            var right = Task("right");
+            var sink = Task("sink");
+            WaitFor(left, root);
+            WaitFor(right, root);
+            WaitFor(sink, left, right);
 
             SetPrivateField(typeof(ABootstrap<TestRootScope>), bootstrap, "rootScope", rootScope);
             SetPrivateField(
                 typeof(ABootstrap<TestRootScope>),
                 bootstrap,
                 "bootstrapTasks",
-                new ABootstrapTask<TestRootScope>[] { firstTask, secondTask });
+                new ABootstrapTask<TestRootScope>[] { sink, left, right, root });
 
-            return gameObject;
+            try
+            {
+                await bootstrap.ExecuteSetupAsync(CancellationToken.None).AsTask();
+
+                Assert.That(log.IndexOf("root end"), Is.LessThan(log.IndexOf("left start")));
+                Assert.That(log.IndexOf("root end"), Is.LessThan(log.IndexOf("right start")));
+                Assert.That(log.IndexOf("left end"), Is.LessThan(log.IndexOf("sink start")));
+                Assert.That(log.IndexOf("right end"), Is.LessThan(log.IndexOf("sink start")));
+                Assert.That(bootstrap.Progress, Is.EqualTo(1f));
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(gameObject);
+            }
+        }
+
+        [Test, Timeout(5000)]
+        public void BootstrapFailingTaskDoesNotHangWhoWaitsForIt()
+        {
+            // The waiter is parked on a gate only the failing task would ever open. It has to fault
+            // that gate on the way out, or the boot stops with no message instead of an exception.
+            var gameObject = new GameObject("bootstrap");
+            gameObject.SetActive(false);
+            var rootScope = gameObject.AddComponent<TestRootScope>();
+            var bootstrap = gameObject.AddComponent<TestBootstrap>();
+
+            var failing = gameObject.AddComponent<ThrowingBootstrapTask>();
+            var waiting = gameObject.AddComponent<TestBootstrapTask>();
+            WaitFor(waiting, failing);
+
+            SetPrivateField(typeof(ABootstrap<TestRootScope>), bootstrap, "rootScope", rootScope);
+            SetPrivateField(
+                typeof(ABootstrap<TestRootScope>),
+                bootstrap,
+                "bootstrapTasks",
+                new ABootstrapTask<TestRootScope>[] { failing, waiting });
+
+            try
+            {
+                Assert.ThrowsAsync<InvalidOperationException>(
+                    async () => await bootstrap.ExecuteSetupAsync(CancellationToken.None).AsTask());
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(gameObject);
+            }
+        }
+
+        [Test]
+        public void BootstrapRejectsWaitingForATaskOutsideTheList()
+        {
+            // It would never run, so the gate would never open and the boot would hang silently.
+            var gameObject = NewBootstrap(out var bootstrap, out var firstTask, out _);
+            var stranger = gameObject.AddComponent<TestBootstrapTask>();
+            WaitFor(firstTask, stranger);
+
+            try
+            {
+                var exception = Assert.ThrowsAsync<InvalidOperationException>(
+                    async () => await bootstrap.ExecuteSetupAsync(CancellationToken.None).AsTask());
+
+                Assert.That(exception.Message, Does.Contain("not in the task list"));
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(gameObject);
+            }
+        }
+
+        [Test]
+        public void BootstrapRejectsTheSameTaskListedTwice()
+        {
+            var gameObject = NewBootstrap(out var bootstrap, out var firstTask, out _);
+
+            SetPrivateField(
+                typeof(ABootstrap<TestRootScope>),
+                bootstrap,
+                "bootstrapTasks",
+                new ABootstrapTask<TestRootScope>[] { firstTask, firstTask });
+
+            try
+            {
+                var exception = Assert.ThrowsAsync<InvalidOperationException>(
+                    async () => await bootstrap.ExecuteSetupAsync(CancellationToken.None).AsTask());
+
+                Assert.That(exception.Message, Does.Contain("more than once"));
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(gameObject);
+            }
         }
 
         [Test]
@@ -736,12 +759,8 @@ namespace Hlight.Foundation.Tests
 
         public sealed class TestBootstrapTask : ABootstrapTask<TestRootScope>
         {
-            public float ReportedProgress { get; set; }
             public string Label { get; set; } = "task";
             public List<string> Log { get; set; }
-
-            public Type[] RequiredTypes { get; set; } = Array.Empty<Type>();
-            public Type[] ProvidedTypes { get; set; } = Array.Empty<Type>();
 
             /// <summary>Signalled as soon as this task starts, to unblock a sibling's Wait.</summary>
             public UniTaskCompletionSource Release { get; set; }
@@ -749,30 +768,52 @@ namespace Hlight.Foundation.Tests
             /// <summary>Blocks this task until a sibling starts — only reachable if they overlap.</summary>
             public UniTaskCompletionSource Wait { get; set; }
 
-            public override Type[] Requires => RequiredTypes;
-            public override Type[] Provides => ProvidedTypes;
-
             public override async UniTask Execute(
                 TestRootScope scope,
-                IProgress<float> progress,
                 CancellationToken cancellationToken)
             {
                 Log?.Add($"{Label} start");
                 Release?.TrySetResult();
                 if (Wait != null) await Wait.Task;
-
-                progress.Report(ReportedProgress);
                 Log?.Add($"{Label} end");
             }
         }
 
-        /// <summary>Stand-ins for whatever a real task hands the scope.</summary>
-        private sealed class ProvidedByFirst
+        /// <summary>A disabled bootstrap wired to two blank tasks, in list order.</summary>
+        private static GameObject NewBootstrap(
+            out TestBootstrap bootstrap,
+            out TestBootstrapTask firstTask,
+            out TestBootstrapTask secondTask)
         {
+            var gameObject = new GameObject("bootstrap");
+            gameObject.SetActive(false);
+            var rootScope = gameObject.AddComponent<TestRootScope>();
+            bootstrap = gameObject.AddComponent<TestBootstrap>();
+            firstTask = gameObject.AddComponent<TestBootstrapTask>();
+            secondTask = gameObject.AddComponent<TestBootstrapTask>();
+
+            SetPrivateField(typeof(ABootstrap<TestRootScope>), bootstrap, "rootScope", rootScope);
+            SetPrivateField(
+                typeof(ABootstrap<TestRootScope>),
+                bootstrap,
+                "bootstrapTasks",
+                new ABootstrapTask<TestRootScope>[] { firstTask, secondTask });
+
+            return gameObject;
         }
 
-        private sealed class ProvidedBySecond
+        private static void WaitFor(
+            ABootstrapTask<TestRootScope> task,
+            params ABootstrapTask<TestRootScope>[] awaited)
+            => SetPrivateField(typeof(ABootstrapTask<TestRootScope>), task, "waitFor", awaited);
+
+        /// <summary>Blows up where a dependent is already parked on its gate.</summary>
+        public sealed class ThrowingBootstrapTask : ABootstrapTask<TestRootScope>
         {
+            public override UniTask Execute(
+                TestRootScope scope,
+                CancellationToken cancellationToken)
+                => throw new InvalidOperationException("boom");
         }
 
         /// <summary>Target the scopes configure — the scene one refines what the root set.</summary>
